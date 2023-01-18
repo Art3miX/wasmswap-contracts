@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e -x
 
 # Run this from the scripts directory
 
@@ -13,6 +14,7 @@ RPC='https://rpc.uni.junonetwork.io:443'
 TXFLAG="--gas-prices 0.1$DENOM --gas auto --gas-adjustment 1.3 -y -b block --chain-id $CHAIN_ID --node $RPC"
 QFLAG="--chain-id $CHAIN_ID --node $RPC"
 TESTER_MNEMONIC='siren window salt bullet cream letter huge satoshi fade shiver permit offer happy immense wage fitness goose usual aim hammer clap about super trend'
+PASS='12345678'
 FAUCET_ADDR='juno12gqyglvj4rdg4kcc292s8z7u25d3s4tuph98y8'
 KILL_DOCKER='docker kill cosmwasm'
 
@@ -27,7 +29,7 @@ then
 fi
 
 # Start docker with junod installed
-$KILL_DOCKER &>/dev/null
+$KILL_DOCKER &>/dev/null || true 
 
 docker run --rm -d -t --name cosmwasm \
     --mount type=volume,source=junod_data,target=/root \
@@ -35,10 +37,10 @@ docker run --rm -d -t --name cosmwasm \
     ghcr.io/cosmoscontracts/juno:v11.0.0 sh
 
 # Try to delete faucet if already exists
-$BINARY keys delete faucet -y &>/dev/null
+echo $PASS | $BINARY keys delete faucet -y &>/dev/null || true 
 
 # Add faucet wallet
-echo $TESTER_MNEMONIC | $BINARY keys add faucet --account 1 --recover >/dev/null
+(echo $TESTER_MNEMONIC; echo $PASS; echo $PASS) | $BINARY keys add faucet --account 1 --recover > /dev/null
 
 # LP Data, like pool address, staking address, the cw20 addresses.
 POOL_ADDR=$1
@@ -55,47 +57,57 @@ LP_TOKEN_ADDR=$(echo $LP_RESPONSE | jq -r '.lp_token_address')
 BASE_NAME="ws-tester"
 
 # NOTE: Important to start from index 2, because index 0 is our manual tester, index 1 is our faucet
-for INDEX in {2..2}
+for INDEX in {22..22}
 do
   TESTER_NAME=$BASE_NAME"-"$INDEX
+  echo $TESTER_NAME
+
+  AMT1=$((INDEX * 100))
+  AMT2=$((INDEX * 160))
 
   # Add tester address to junod
-  $BINARY keys delete $TESTER_NAME -y &>/dev/null
-  echo "$TESTER_MNEMONIC" | $BINARY keys add $TESTER_NAME --account $INDEX --recover >/dev/null
-  TESTER_ADDR=$($BINARY keys show $TESTER_NAME --address)
+  echo $PASS | $BINARY keys delete $TESTER_NAME -y &>/dev/null || true 
+  (echo $TESTER_MNEMONIC; echo $PASS; echo $PASS) | $BINARY keys add $TESTER_NAME --account $INDEX --recover >/dev/null
+  TESTER_ADDR=$(echo $PASS | $BINARY keys show $TESTER_NAME --address)
 
   # Use bank to fund wallet from faucet (for gas and pool)
-  $BINARY tx bank send faucet $TESTER_ADDR 100000ujunox $TXFLAG >/dev/null || exit
+  echo $PASS | $BINARY tx bank send faucet $TESTER_ADDR 100000ujunox $TXFLAG >/dev/null
 
   if [ -n "$TOKEN_1_ADDR" ]
   then
     # CW20 token, use transfer to fund wallet from faucet
-    $BINARY tx wasm execute $TOKEN_1_ADDR '{"transfer":{"recipient":"'"$TESTER_ADDR"'","amount":"150"}}' --from faucet $TXFLAG >/dev/null || exit
+    echo $PASS | $BINARY tx wasm execute $TOKEN_1_ADDR '{"transfer":{"recipient":"'"$TESTER_ADDR"'","amount":"'"$AMT1"'"}}' --from faucet $TXFLAG >/dev/null
     TOKEN_ADDR=$TOKEN_1_ADDR
   else
     # Its native token, we need to add funds (--amount)
-    FUNDS="--amount 100ujunox"
+    FUNDS="--amount ${AMT1}ujunox"
   fi
 
   if [ -n "$TOKEN_2_ADDR" ]
   then
     # CW20 token, use transfer to fund wallet from faucet
-    $BINARY tx wasm execute $TOKEN_2_ADDR '{"transfer":{"recipient":"'"$TESTER_ADDR"'","amount":"150"}}' --from faucet $TXFLAG >/dev/null || exit
+    echo $PASS | $BINARY tx wasm execute $TOKEN_2_ADDR '{"transfer":{"recipient":"'"$TESTER_ADDR"'","amount":"'"$AMT2"'"}}' --from faucet $TXFLAG >/dev/null
     TOKEN_ADDR=$TOKEN_2_ADDR
   else
     # Its native token, we need to add funds (--amount)
-    FUNDS="--amount 150ujunox"
+    FUNDS="--amount ${AMT2}ujunox"
   fi
 
   # increase allowance
-  $BINARY tx wasm execute $TOKEN_ADDR '{"increase_allowance":{"amount":"20000","spender":"'"$POOL_ADDR"'"}}' --from $TESTER_NAME $TXFLAG || exit
+  echo $PASS | $BINARY tx wasm execute $TOKEN_ADDR '{"increase_allowance":{"amount":"20000","spender":"'"$POOL_ADDR"'"}}' --from $TESTER_NAME $TXFLAG >/dev/null
 
   # Add liquidity
-  $BINARY tx wasm execute $POOL_ADDR '{"add_liquidity":{"token1_amount":"100","min_liquidity":"1","max_token2":"150"}}' --from $TESTER_NAME $FUNDS $TXFLAG || exit
+  echo $PASS | $BINARY tx wasm execute $POOL_ADDR '{"add_liquidity":{"token1_amount":"'"$AMT1"'","min_liquidity":"1","max_token2":"'"$AMT2"'"}}' --from $TESTER_NAME $FUNDS $TXFLAG >/dev/null
 
+  # Query available LP shares
+  LP_BALANCE=$($BINARY query wasm contract-state smart $LP_TOKEN_ADDR '{"balance":{"address":"'"$TESTER_ADDR"'"}}' --output json $QFLAG | jq -r '.data.balance')
   # Stake
   staking_msg=`echo '{"stake":{}}' | base64`
-  $BINARY tx wasm execute $LP_TOKEN_ADDR '{"send":{"contract":"'"$STAKING_ADDR"'","amount":"90","msg":"'"$staking_msg"'"}}' --from $TESTER_NAME $TXFLAG
+  echo $PASS | $BINARY tx wasm execute $LP_TOKEN_ADDR '{"send":{"contract":"'"$STAKING_ADDR"'","amount":"'"$LP_BALANCE"'","msg":"'"$staking_msg"'"}}' --from $TESTER_NAME $TXFLAG >/dev/null
+
+  # unbond a few
+  UNBOND=$((LP_BALANCE / 3))
+  echo $PASS | $BINARY tx wasm execute $STAKING_ADDR '{"unstake":{"amount":"'"$UNBOND"'"}}' --from $TESTER_NAME $TXFLAG >/dev/null
 
   # Increase index
   let INDEX=INDEX+1
